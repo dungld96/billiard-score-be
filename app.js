@@ -187,4 +187,7 @@ app.post("/games/:id/undo", async (req, res) => {
   }
 });
 
-module.exports = { app, supabase };
+// Export the express `app` as the module default so Vercel recognizes it
+// Attach `supabase` as a property for convenience in dev/test scenarios
+module.exports = app;
+module.exports.supabase = supabase;
