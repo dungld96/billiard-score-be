@@ -23,6 +23,21 @@ app.use(bodyParser.json());
 // Health
 app.get("/health", (req, res) => res.json({ status: "ok" }));
 
+// Get all games
+app.get("/games", async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("games")
+      .select()
+      .order("created_at", { ascending: false });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message || e });
+  }
+});
+
 // Create a new game
 app.post("/games", async (req, res) => {
   try {
