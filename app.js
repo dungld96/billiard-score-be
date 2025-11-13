@@ -17,7 +17,12 @@ const supabase = createClient(SUPABASE_URL || "", SUPABASE_KEY || "", {
 });
 
 const app = express();
-app.use(cors());
+app.use(cors({
+  origin: "*",
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"]
+}));
 app.use(bodyParser.json());
 
 // Health
