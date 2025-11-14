@@ -49,7 +49,7 @@ app.get("/games", async (req, res) => {
     const { data, error } = await supabase
       .from("games")
       .select()
-      .order("created_at", { ascending: false });
+      .order("created_at", { ascending: true });
     if (error) throw error;
 
     // Fetch players and scores for each game
@@ -164,23 +164,6 @@ app.post("/games", async (req, res) => {
   }
 });
 
-// Start game
-app.post("/games/:id/start", async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { data, error } = await supabase
-      .from("games")
-      .update({ status: "started" })
-      .eq("id", id)
-      .select()
-      .single();
-    if (error) throw error;
-    res.json(data);
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: e.message || e });
-  }
-});
 
 // GET /games/:id
 app.get('/games/:id', async (req, res) => {
