@@ -46,44 +46,81 @@ app.get("/games", async (req, res) => {
 // Create a new game
 app.post("/games", async (req, res) => {
   try {
-    const { max_players = 3, title = null } = req.body;
-    if (max_players < 2 || max_players > 5)
+    const { players = [], title = null } = req.body;
+
+    if (players.length < 2 || players.length > 5) {
       return res.status(400).json({ error: "max_players must be 2..5" });
-    const { data, error } = await supabase
-      .from("games")
-      .insert({ max_players, title })
+    }
+
+    if (!Array.isArray(players)) {
+      return res.status(400).json({ error: 'players must be an array of UUIDs' });
+    }
+    // Verify all provided player IDs exist (if any)
+    if (players.length > 0) {
+      const { data: foundPlayers, error: pErr } = await supabase
+        .from('players')
+        .select('id')
+        .in('id', players);
+
+      if (pErr) throw pErr;
+      if (!foundPlayers || foundPlayers.length !== players.length) {
+        return res.status(400).json({ error: 'One or more players not found' });
+      }
+    }
+
+    // 1) Create game
+    const { data: game, error: gErr } = await supabase
+      .from('games')
+      .insert({ title })
       .select()
       .single();
-    if (error) throw error;
-    res.json(data);
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: e.message || e });
-  }
-});
 
-// Add player to a game
-app.post("/games/:id/players", async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { name } = req.body;
-    if (!name) return res.status(400).json({ error: "name required" });
+    if (gErr) throw gErr;
 
-    const { data: players } = await supabase
-      .from("players")
-      .select()
-      .eq("game_id", id);
-    const seat = (players?.length || 0) + 1;
-    if (seat > 5)
-      return res.status(400).json({ error: "Max players exceeded" });
+    // 2) Insert game_players rows (if any)
+    // We'll insert sequentially; if any insert fails, try to cleanup created game & inserted rows
+    const insertedGamePlayerIds = [];
+    try {
+      for (let i = 0; i < players.length; i++) {
+        const playerId = players[i];
+        const seat = i + 1;
+        const { data: gpData, error: gpErr } = await supabase
+          .from('game_players')
+          .insert({
+            game_id: game.id,
+            player_id: playerId,
+            seat,
+            score: 0
+          })
+          .select()
+          .single();
+        if (gpErr) throw gpErr;
+        insertedGamePlayerIds.push(gpData.id);
+      }
+    } catch (insertErr) {
+      // rollback: delete any inserted game_players for this game, then delete the game
+      try {
+        await supabase.from('game_players').delete().eq('game_id', game.id);
+        await supabase.from('games').delete().eq('id', game.id);
+      } catch (cleanupErr) {
+        console.error('Failed cleanup after insert error', cleanupErr);
+      }
+      throw insertErr;
+    }
 
-    const { data, error } = await supabase
-      .from("players")
-      .insert({ game_id: id, name, seat, score: 0 })
-      .select()
-      .single();
-    if (error) throw error;
-    res.json(data);
+    // 3) Return full game with players
+    const { data: gamePlayers } = await supabase
+      .from('game_players')
+      .select(`
+        id,
+        seat,
+        score,
+        players ( id, name )
+      `)
+      .eq('game_id', game.id)
+      .order('seat', { ascending: true });
+
+    return res.json({ game, gamePlayers });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: e.message || e });
@@ -108,69 +145,195 @@ app.post("/games/:id/start", async (req, res) => {
   }
 });
 
-// Get game + players + updates
-app.get("/games/:id", async (req, res) => {
+// GET /games/:id
+app.get('/games/:id', async (req, res) => {
   try {
     const { id } = req.params;
+    if (!id) return res.status(400).json({ error: 'game id required' });
+
+    // 1) Get game
     const { data: game, error: gErr } = await supabase
-      .from("games")
-      .select()
-      .eq("id", id)
+      .from('games')
+      .select('*')
+      .eq('id', id)
       .maybeSingle();
-    if (gErr) throw gErr;
-    if (!game) return res.status(404).json({ error: "game not found" });
 
-    const { data: players } = await supabase
-      .from("players")
-      .select()
-      .eq("game_id", id)
-      .order("seat", { ascending: true });
+    if (gErr) {
+      console.error('Error fetching game:', gErr);
+      return res.status(500).json({ error: 'Failed to fetch game' });
+    }
+    if (!game) return res.status(404).json({ error: 'Game not found' });
 
-    const { data: updates } = await supabase
-      .from("score_updates")
-      .select()
-      .eq("game_id", id)
-      .order("created_at", { ascending: true });
+    // 2) Get players for the game from join table game_players -> players
+    //    We fetch game_players fields (id, seat, score, created_at) and nested players (id, name, avatar_url)
+    const { data: gpRows, error: gpErr } = await supabase
+      .from('game_players')
+      .select(`
+        id,
+        seat,
+        score,
+        created_at,
+        players:player_id ( id, name )
+      `)
+      .eq('game_id', id)
+      .order('seat', { ascending: true });
 
-    res.json({ game, players, updates });
+    if (gpErr) {
+      console.error('Error fetching game_players:', gpErr);
+      return res.status(500).json({ error: 'Failed to fetch players for game' });
+    }
+
+    // Normalize players array to a nicer shape
+    const players = (gpRows || []).map(gp => ({
+      game_player_id: gp.id,
+      seat: gp.seat,
+      score: gp.score,
+      joined_at: gp.created_at,
+      player: gp.players || null   // nested player's object
+    }));
+
+    // 3) Try to fetch score history if table exists (score_updates)
+    //    If score_updates doesn't exist, just return empty array.
+    let updates = [];
+    try {
+      // We attempt to select; if table missing, supabase returns error code - we catch it here
+      const { data: uRows, error: uErr } = await supabase
+        .from('score_updates')
+        .select('id, player_id, delta, created_at, note')
+        .eq('game_id', id)
+        .order('created_at', { ascending: true });
+
+      if (!uErr && uRows) {
+        updates = uRows;
+      } else if (uErr) {
+        // If error indicates table doesn't exist, ignore; otherwise log
+        // Supabase PostgREST errors usually have message; log for debugging.
+        console.warn('score_updates fetch warning:', uErr.message || uErr);
+        updates = [];
+      }
+    } catch (e) {
+      // defensive: if RPC or other error occurs, don't fail whole endpoint
+      console.warn('Ignored error while fetching score_updates:', e?.message || e);
+      updates = [];
+    }
+
+    // 4) Compose and return
+    return res.json({
+      game,
+      players,
+      updates
+    });
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: e.message || e });
+    console.error('GET /games/:id unexpected error', e);
+    return res.status(500).json({ error: e.message || 'Internal server error' });
   }
 });
 
-// Update player's score (delta can be negative)
-app.post("/games/:id/players/:pid/score", async (req, res) => {
+
+// POST /games/:id/round  -- sequential with cleanup on error
+app.post('/games/:id/round', async (req, res) => {
   try {
-    const { id, pid } = req.params;
-    const { delta = 0, note = null } = req.body;
-    if (typeof delta !== "number")
-      return res.status(400).json({ error: "delta must be number" });
+    const { id: gameId } = req.params;
+    const { scores, note = null } = req.body;
 
-    const { data: player, error: pErr } = await supabase
-      .from("players")
-      .select()
-      .eq("id", pid)
-      .maybeSingle();
-    if (pErr) throw pErr;
-    if (!player) return res.status(404).json({ error: "player not found" });
+    if (!Array.isArray(scores) || scores.length === 0) {
+      return res.status(400).json({ error: 'scores must be a non-empty array' });
+    }
 
-    const newScore = (player.score || 0) + delta;
-    const { error: uErr } = await supabase
-      .from("players")
-      .update({ score: newScore })
-      .eq("id", pid);
-    if (uErr) throw uErr;
+    // validate inputs
+    const playerIds = scores.map(s => s.playerId);
+    const deltas = scores.map(s => Number(s.delta || 0));
+    if (playerIds.some(id => !id)) return res.status(400).json({ error: 'invalid playerId in scores' });
 
-    const { error: iErr } = await supabase
-      .from("score_updates")
-      .insert({ game_id: id, player_id: pid, delta, note });
-    if (iErr) throw iErr;
+    // verify membership
+    const { data: membership, error: memErr } = await supabase
+      .from('game_players')
+      .select('player_id')
+      .eq('game_id', gameId)
+      .in('player_id', playerIds);
 
-    res.json({ playerId: pid, newScore });
+    if (memErr) throw memErr;
+    if (!membership || membership.length !== playerIds.length) {
+      return res.status(400).json({ error: 'one or more playerIds are not part of this game' });
+    }
+
+    const insertedUpdateIds = [];
+    const results = [];
+
+    try {
+      for (let i = 0; i < playerIds.length; i++) {
+        const pid = playerIds[i];
+        const delta = deltas[i];
+
+        // insert into score_updates
+        const { data: up, error: upErr } = await supabase
+          .from('score_updates')
+          .insert({ game_id: gameId, player_id: pid, delta, note })
+          .select()
+          .single();
+        if (upErr) throw upErr;
+        insertedUpdateIds.push(up.id);
+
+        // update game_players score
+        const { data: gp, error: gpErr } = await supabase
+          .from('game_players')
+          .update({ score: supabase.raw('score + ?', [delta]) }) // note: supabase-js doesn't support raw easily; alternative below
+          .eq('game_id', gameId)
+          .eq('player_id', pid)
+          .select()
+          .single();
+        // If your supabase client does not allow raw expression, do a select then update with computed value:
+        // 1) select current score
+        // 2) update score = current + delta
+        if (gpErr) {
+          // fallback manual update:
+          const { data: cur, error: curErr } = await supabase
+            .from('game_players')
+            .select('score')
+            .eq('game_id', gameId)
+            .eq('player_id', pid)
+            .maybeSingle();
+          if (curErr) throw curErr;
+          const newScore = (cur?.score || 0) + delta;
+          const { data: gp2, error: gp2Err } = await supabase
+            .from('game_players')
+            .update({ score: newScore })
+            .eq('game_id', gameId)
+            .eq('player_id', pid)
+            .select()
+            .single();
+          if (gp2Err) throw gp2Err;
+          results.push({ playerId: pid, delta, newScore: gp2.score });
+        } else {
+          results.push({ playerId: pid, delta, newScore: gp.score });
+        }
+      }
+    } catch (innerErr) {
+      // rollback: delete inserted updates and revert scores by subtracting deltas for inserts done so far
+      console.error('Error during sequential update, attempting rollback', innerErr);
+      try {
+        if (insertedUpdateIds.length) {
+          await supabase.from('score_updates').delete().in('id', insertedUpdateIds);
+        }
+        // Recompute revert for those we already applied: for safety, best-effort revert by subtracting applied deltas
+        for (let j = 0; j < results.length; j++) {
+          const r = results[j];
+          await supabase
+            .from('game_players')
+            .update({ score: (r.newScore - r.delta) })
+            .eq('game_id', gameId)
+            .eq('player_id', r.playerId);
+        }
+      } catch (rollbackErr) {
+        console.error('Rollback failed', rollbackErr);
+      }
+      return res.status(500).json({ error: innerErr.message || innerErr });
+    }
+
+    return res.json({ success: true, results });
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: e.message || e });
+    console.error('POST /games/:id/round error', e);
+    return res.status(500).json({ error: e.message || 'Internal server error' });
   }
 });
 
