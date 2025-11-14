@@ -49,7 +49,7 @@ app.get("/games", async (req, res) => {
     const { data, error } = await supabase
       .from("games")
       .select()
-      .order("created_at", { ascending: true });
+      .order("created_at", { ascending: false });
     if (error) throw error;
 
     // Fetch players and scores for each game
@@ -221,7 +221,7 @@ app.get('/games/:id', async (req, res) => {
         .from('score_updates')
         .select('id, player_id, delta, created_at, note')
         .eq('game_id', id)
-        .order('created_at', { ascending: true });
+        .order('created_at', { ascending: false });
 
       if (!uErr && uRows) {
         updates = uRows;
