@@ -51,7 +51,29 @@ app.get("/games", async (req, res) => {
       .select()
       .order("created_at", { ascending: false });
     if (error) throw error;
-    res.json(data || []);
+
+    // Fetch players and scores for each game
+    const gamesWithPlayers = await Promise.all(
+      (data || []).map(async (game) => {
+        const { data: gamePlayers } = await supabase
+          .from('game_players')
+          .select(`
+            id,
+            seat,
+            score,
+            players ( id, name )
+          `)
+          .eq('game_id', game.id)
+          .order('seat', { ascending: true });
+
+        return {
+          ...game,
+          gamePlayers: gamePlayers || []
+        };
+      })
+    );
+
+    res.json(gamesWithPlayers || []);
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: e.message || e });
