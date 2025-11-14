@@ -289,39 +289,24 @@ app.post('/games/:id/round', async (req, res) => {
         if (upErr) throw upErr;
         insertedUpdateIds.push(up.id);
 
-        // update game_players score
+        // get current score, compute new score, then update
+        const { data: cur, error: curErr } = await supabase
+          .from('game_players')
+          .select('score')
+          .eq('game_id', gameId)
+          .eq('player_id', pid)
+          .maybeSingle();
+        if (curErr) throw curErr;
+        const newScore = (cur?.score || 0) + delta;
         const { data: gp, error: gpErr } = await supabase
           .from('game_players')
-          .update({ score: supabase.raw('score + ?', [delta]) }) // note: supabase-js doesn't support raw easily; alternative below
+          .update({ score: newScore })
           .eq('game_id', gameId)
           .eq('player_id', pid)
           .select()
           .single();
-        // If your supabase client does not allow raw expression, do a select then update with computed value:
-        // 1) select current score
-        // 2) update score = current + delta
-        if (gpErr) {
-          // fallback manual update:
-          const { data: cur, error: curErr } = await supabase
-            .from('game_players')
-            .select('score')
-            .eq('game_id', gameId)
-            .eq('player_id', pid)
-            .maybeSingle();
-          if (curErr) throw curErr;
-          const newScore = (cur?.score || 0) + delta;
-          const { data: gp2, error: gp2Err } = await supabase
-            .from('game_players')
-            .update({ score: newScore })
-            .eq('game_id', gameId)
-            .eq('player_id', pid)
-            .select()
-            .single();
-          if (gp2Err) throw gp2Err;
-          results.push({ playerId: pid, delta, newScore: gp2.score });
-        } else {
-          results.push({ playerId: pid, delta, newScore: gp.score });
-        }
+        if (gpErr) throw gpErr;
+        results.push({ playerId: pid, delta, newScore: gp.score });
       }
     } catch (innerErr) {
       // rollback: delete inserted updates and revert scores by subtracting deltas for inserts done so far
